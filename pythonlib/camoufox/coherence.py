@@ -1,9 +1,9 @@
 """Whole-identity coherence: the checks that look at more than one field.
 
 Camoufox assembles an identity from several pools -- the navigator and screen
-from the fingerprint generator, the GPU from `webgl_data.db`, fonts and voices
-from its own catalogues, media devices from `media-devices.json`. Each pool is
-sampled on its own, so a combination that no machine has ever had can be built
+from the fingerprint generator, the GPU from fpgen's WebGL records, fonts and
+voices from its own catalogues, media devices from `media-devices.json`. Each
+pool is sampled on its own, so a combination that no machine has ever had can be built
 out of individually plausible parts: an Apple M1 with 2 cores, a Mac reporting a
 Braswell Atom GPU, a Linux identity whose platform says armv81 while its user
 agent says x86_64.
@@ -43,10 +43,15 @@ APPLE_SILICON_CORES = frozenset({8, 10, 11, 12, 14, 16, 20, 24, 28, 32})
 # Linux reports 1, or 2 under HiDPI, with GNOME fractional scaling giving the
 # 1.25/1.5/1.75 steps. Values outside these (1.818, 1.09, 1.36) are scraped
 # artefacts -- a browser zoom level folded into the ratio, not a display mode.
+#
+# Ascending tuples, not sets: the repair keeps the first of two equally near
+# steps, and a frozenset literal iterates in a different order when compiled
+# than when loaded from a .pyc -- so a set made the first launch repair an
+# identity differently from every later one.
 PLAUSIBLE_DPR = {
-    'win': frozenset({1, 1.25, 1.5, 1.75, 2, 2.5, 3}),
-    'mac': frozenset({1, 2}),
-    'lin': frozenset({1, 1.25, 1.5, 1.75, 2}),
+    'win': (1, 1.25, 1.5, 1.75, 2, 2.5, 3),
+    'mac': (1, 2),
+    'lin': (1, 1.25, 1.5, 1.75, 2),
 }
 
 # colorDepth: Firefox reports 24, or 30 on a deep-colour display. macOS defaults
@@ -78,9 +83,9 @@ BROWSER_CHROME_HEIGHT = 86
 
 # GPU strings that are not possible on macOS. Firefox on a Mac reports Apple
 # Silicon as "Apple M1, or similar", and Intel Macs as an Intel Iris/UHD/HD
-# 4000-6000 part; ANGLE is Windows-only (Direct3D), and these two rows in
-# webgl_data.db are a Braswell Atom IGP and a desktop PC card, neither of which
-# shipped in any Mac.
+# 4000-6000 part; ANGLE is Windows-only (Direct3D), and the other two, which
+# fpgen records from macOS, are a Braswell Atom IGP and a desktop PC card,
+# neither of which shipped in any Mac.
 _NOT_A_MAC_GPU = ('ANGLE', 'Intel(R) HD Graphics 400', 'Radeon R9 200 Series', 'llvmpipe')
 
 
@@ -128,7 +133,7 @@ def _repair_apple_silicon_cores(config: Dict[str, Any], target_os: str) -> None:
 def gpu_fits_os(renderer: Optional[str], target_os: str) -> bool:
     """Whether this renderer string is one the OS can report.
 
-    Used both to check a finished identity and to filter `webgl_data.db` before
+    Used both to check a finished identity and to filter fpgen's GPUs before
     sampling, so the two can never disagree about what a Mac may claim.
     """
     renderer = str(renderer or '')

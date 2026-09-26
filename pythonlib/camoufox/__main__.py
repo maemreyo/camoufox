@@ -36,7 +36,6 @@ from .multiversion import (
     remove_version,
     save_config,
     save_repo_cache,
-    set_active,
 )
 from .pkgman import (
     INSTALL_DIR,
@@ -681,7 +680,7 @@ def _list_installed(show_paths: bool):
         rprint("    └── Not configured", fg="yellow")
 
 
-def _list_all(_show_paths: bool):
+def _list_all(show_paths: bool):
     """
     List all available versions from synced repos
     """
@@ -721,6 +720,8 @@ def _list_all(_show_paths: bool):
                     click.secho(" (installed, active)", fg="green", bold=True, nl=False)
                 else:
                     click.secho(" (installed)", fg="green", nl=False)
+                if show_paths:
+                    click.secho(f" -> {inst.path}", fg="bright_black", nl=False)
 
             click.echo()
 
@@ -866,7 +867,6 @@ class VersionInfo:
         self._header("Python Packages")
         self._pkg("Camoufox", "camoufox")
         self._pkg("fpgen", "fpgen")
-        self._pkg("Apify Fingerprints", "apify_fingerprint_datapoints")
         self._pkg("Playwright", "playwright")
 
     def browser(self):
@@ -952,7 +952,7 @@ class VersionInfo:
 
         self._header("GeoIP")
         if not ALLOW_GEOIP:
-            # geoip2 package not installed
+            # maxminddb not installed
             self._row("Status", "Not supported (install camoufox[geoip])", style="dim")
         else:
             mmdb_path = get_mmdb_path()

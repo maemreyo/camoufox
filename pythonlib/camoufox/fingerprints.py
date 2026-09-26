@@ -6,11 +6,12 @@ import secrets
 import unicodedata
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from random import Random, choice, randint, randrange, random, sample, shuffle
+from random import Random, choice, randint, randrange
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
+from camoufox._warnings import FallbackWarning
+from camoufox.ip import valid_ipv4, validate_ip
 from camoufox.pkgman import load_yaml
-from camoufox.webgl import sample_webgl
 
 # Load the fpgen mapping file
 FPGEN_DATA = load_yaml('fpgen.yml')
@@ -399,7 +400,10 @@ def _load_font_groups() -> Dict[str, List[Dict[str, Any]]]:
         try:
             with open(path, 'rb') as f:
                 _FONT_GROUPS_CACHE = json.loads(f.read())
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            FallbackWarning.warn(
+                'Reading font-groups.json', 'an OS-version base with no font additions', e
+            )
             _FONT_GROUPS_CACHE = {}
     return _FONT_GROUPS_CACHE
 
@@ -422,7 +426,10 @@ def _load_font_bases() -> Dict[str, List[Dict[str, Any]]]:
         try:
             with open(path, 'rb') as f:
                 _FONT_BASES_CACHE = json.loads(f.read())
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            FallbackWarning.warn(
+                'Reading font-bases.json', 'only the always-present core fonts as its OS base', e
+            )
             _FONT_BASES_CACHE = {}
     return _FONT_BASES_CACHE
 
@@ -593,44 +600,6 @@ def _generate_random_font_subset(
     _ensure_marker_fonts(result, markers)
 
     return result
-
-
-# OS voice lists loaded from voices.json, parsed into "Name:lang:type" tuples.
-_OS_VOICES_CACHE: Optional[Dict[str, List[Tuple[str, str, str]]]] = None
-
-
-def _load_os_voices() -> Dict[str, List[Tuple[str, str, str]]]:
-    """Load OS voice lists from voices.json as (name, lang, type) tuples.
-
-    Each entry is "Name:lang:type" (type is "local" or "remote"). Voice names
-    may contain parens/commas but not colons, so a last-two-colons split is
-    safe.
-    """
-    global _OS_VOICES_CACHE
-    if _OS_VOICES_CACHE is not None:
-        return _OS_VOICES_CACHE
-    voices_path = os.path.join(os.path.dirname(__file__), 'voices.json')
-    with open(voices_path, 'rb') as f:
-        import orjson
-        raw = orjson.loads(f.read())
-    _OS_VOICES_CACHE = {}
-    for os_key, entries in raw.items():
-        parsed: List[Tuple[str, str, str]] = []
-        for entry in entries:
-            last = entry.rfind(':')
-            if last < 0:
-                continue
-            vtype = entry[last + 1:]
-            before = entry[:last]
-            langsep = before.rfind(':')
-            if langsep < 0:
-                continue
-            lang = before[langsep + 1:]
-            name = before[:langsep]
-            if name and lang:
-                parsed.append((name, lang, vtype))
-        _OS_VOICES_CACHE[os_key] = parsed
-    return _OS_VOICES_CACHE
 
 
 # Essential speech voices per OS that must always be included in subsets
@@ -1305,8 +1274,8 @@ def draw_media_devices(os_key: str, seed: Optional[int]) -> Dict[str, Any]:
 
 # -- WebGL <-> screen coherence (#729) ---------------------------------------
 #
-# BrowserForge picks navigator/screen; the GPU is drawn separately from
-# webgl_data.db weighted only by OS. Nothing ties the two together, so the
+# fpgen picks navigator/screen; the GPU is drawn separately, weighted only by
+# OS (camoufox.webgl). Nothing ties the two together, so the
 # synthetic path can emit pairs no real machine ships -- a discrete GPU behind
 # a 1024x600 netbook panel. Consistency checks (Pixelscan, Fingerprint.com)
 # read that as masking even when every individual value is plausible alone.
@@ -1344,8 +1313,8 @@ _SOFTWARE_RENDERERS: Tuple[str, ...] = (
     'Generic Renderer',
 )
 
-# Discrete NVIDIA, plus the AMD R5/R7/R9/RX/Vega bucket. Everything else in
-# webgl_data.db reaches down into netbook territory and gets no floor at all:
+# Discrete NVIDIA, plus the AMD R5/R7/R9/RX/Vega bucket. Every other GPU
+# Firefox reports reaches down into netbook territory and gets no floor at all:
 # the "Intel(R) HD Graphics" bucket swallows the GMA 3150 netbook chipset,
 # "Radeon HD 3200 Graphics" is Gecko's catch-all for a bare "AMD"/"Radeon"
 # (the C-50/E-350 netbook APUs included), and Apple silicon drives arbitrary
@@ -1455,57 +1424,6 @@ def gpu_screen_is_plausible(
     if _renderer_bucket(renderer) not in _DISCRETE_GPU_BUCKETS:
         return True
     return width * height > _NETBOOK_MAX_PIXELS
-
-
-def sample_webgl_for_screen(
-    target_os: str,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
-    attempts: int = 32,
-    seed: Optional[int] = None,
-) -> Dict[str, str]:
-    """Sample a WebGL profile that is coherent with the screen already chosen.
-
-    Rejection sampling, so the GPU keeps webgl_data.db's real OS-weighted
-    distribution -- we only drop draws that contradict the screen. The screen
-    itself is left alone on purpose: it has already been reconciled with the
-    real display and the window box (clamp_screen_to_display,
-    fix_screen_no_taskbar, clamp_window_dimensions, clamp_window_position),
-    and widening it here to flatter the GPU would push a headful window back
-    off the monitor it is drawn on (#499).
-
-    Software rasterisers are the one exception to keeping the pool's rate: a
-    draw that lands on llvmpipe / WARP / SwiftShader is resampled, so they
-    never present as the GPU (see below). That does cost fidelity -- the corpus
-    records them at ~1.5%, because real users do run without working drivers --
-    but "no consumer machine reports llvmpipe" is a live, standard check on a
-    string every fingerprint script already reads, so the trade is worth it.
-    Reviewed against the JS-detectability bar on 2026-09-17 and kept.
-
-    Falls back to that first draw when the pool holds nothing coherent, so an
-    unusual screen degrades to today's behaviour rather than raising.
-    """
-    # A software rasteriser (llvmpipe / SwiftShader / WARP) as the presented
-    # GPU is what every consumer-hardware check flags first ("no consumer
-    # machine reports llvmpipe" -- sundial, measured 2026-09-14), so the draw
-    # never settles on one: keep drawing until a hardware renderer that fits
-    # the screen comes up, and only fall back to the first draw if the pool
-    # holds nothing better.
-    first = sample_webgl(target_os, seed=seed)
-    renderer = first.get('webGl:renderer')
-    if not is_software_renderer(renderer) and gpu_screen_is_plausible(renderer, width, height):
-        return first
-
-    fallback = None if is_software_renderer(renderer) else first
-    for attempt in range(attempts - 1):
-        candidate = sample_webgl(target_os, seed=None if seed is None else seed + 1 + attempt)
-        renderer = candidate.get('webGl:renderer')
-        if is_software_renderer(renderer):
-            continue
-        if gpu_screen_is_plausible(renderer, width, height):
-            return candidate
-        fallback = fallback or candidate
-    return fallback or first
 
 
 def _select_presets_file(ff_version: Optional[Any] = None) -> Path:
@@ -1682,12 +1600,8 @@ def from_preset(preset: Dict, ff_version: Optional[str] = None, salt: Optional[i
     if webgl.get('unmaskedRenderer'):
         config['webGl:renderer'] = webgl['unmaskedRenderer']
 
-    # Generate unique random seeds per launch (1 to 2^32-1, excluding 0 which is a no-op in C++)
-    # fonts:spacing_seed stays 0 (off): glyph-advance perturbation produces text
-    # widths no real machine emits (see launch_options in utils.py).
-    config['fonts:spacing_seed'] = 0
+    # Generate a unique audio seed per launch (1 to 2^32-1, excluding 0 which is a no-op in C++)
     config['audio:seed'] = randint(1, 4_294_967_295)  # nosec
-    config['canvas:seed'] = randint(1, 4_294_967_295)  # nosec
 
     if preset.get('timezone'):
         config['timezone'] = preset['timezone']
@@ -1702,10 +1616,16 @@ def from_preset(preset: Dict, ff_version: Optional[str] = None, salt: Optional[i
         target_os = 'linux'
     else:
         target_os = 'macos'
+    preset_key = f"{config.get('navigator.userAgent')} / {config.get('webGl:renderer')}"
     try:
         config['fonts'] = _generate_random_font_subset(target_os, seed=identity_seed(config, salt))
-    except Exception:
-        # Fallback to preset fonts if font generation fails
+    except (OSError, ValueError) as e:
+        FallbackWarning.warn(
+            'Drawing the font list',
+            "the preset's recorded fonts" if preset.get('fonts') else "the browser's own fonts",
+            e,
+            preset_key,
+        )
         if preset.get('fonts'):
             fonts = list(preset['fonts'])
             _ensure_marker_fonts(fonts, {
@@ -1717,7 +1637,13 @@ def from_preset(preset: Dict, ff_version: Optional[str] = None, salt: Optional[i
     # Generate a unique random voice subset from the OS voice list
     try:
         config['voices'] = _generate_random_voice_subset(target_os, seed=identity_seed(config, salt))
-    except Exception:
+    except (OSError, ValueError, KeyError) as e:
+        FallbackWarning.warn(
+            'Drawing the speech voices',
+            "the preset's recorded voices" if preset.get('speechVoices') else "the browser's own voices",
+            e,
+            preset_key,
+        )
         if preset.get('speechVoices'):
             config['voices'] = _normalize_preset_voices(
                 preset['speechVoices'], target_os
@@ -1736,9 +1662,7 @@ def _build_init_script(values: Dict[str, Any]) -> str:
     lines = ['(function(v) {', '  var w = window;']
 
     setters = [
-        ('fontSpacingSeed', 'setFontSpacingSeed', '{val}'),
         ('audioFingerprintSeed', 'setAudioFingerprintSeed', '{val}'),
-        ('canvasSeed', 'setCanvasSeed', '{val}'),
         ('navigatorPlatform', 'setNavigatorPlatform', '{val}'),
         ('navigatorOscpu', 'setNavigatorOscpu', '{val}'),
         ('navigatorUserAgent', 'setNavigatorUserAgent', '{val}'),
@@ -1783,8 +1707,10 @@ def _build_init_script(values: Dict[str, Any]) -> str:
     # WebRTC IP
     ip = values.get('webrtcIP')
     if ip:
+        validate_ip(ip)
+        fn_name = 'setWebRTCIPv4' if valid_ipv4(ip) else 'setWebRTCIPv6'
         lines.append(
-            f'  if (typeof w.setWebRTCIPv4 === "function") w.setWebRTCIPv4({_json.dumps(ip)});'
+            f'  if (typeof w.{fn_name} === "function") w.{fn_name}({_json.dumps(ip)});'
         )
     else:
         lines.append(
@@ -1827,7 +1753,7 @@ def generate_context_fingerprint(
     Generate fingerprint values for a single per-context identity.
     Returns a dict with init_script (JS string) and context_options (Playwright options).
 
-    By default, uses BrowserForge for infinite unique synthetic fingerprints.
+    By default, fpgen generates a unique synthetic fingerprint.
     Pass a preset dict to use a real fingerprint preset instead.
 
     Parameters:
@@ -1838,8 +1764,7 @@ def generate_context_fingerprint(
             normalize_locale() and injected into config. Also sets
             context_options['locale'] for Playwright.
         config_overrides: Dict of CAMOU_CONFIG keys to override after config
-            is built but before init_script is rendered. Useful for disabling
-            perturbation (e.g. {'fonts:spacing_seed': 0}).
+            is built but before init_script is rendered (e.g. {'audio:seed': 7}).
     """
     if preset is not None:
         # Use real fingerprint preset
@@ -1856,9 +1781,7 @@ def generate_context_fingerprint(
         _salt = identity_salt()
 
         # Add seeds (the generator doesn't produce these)
-        config.setdefault('fonts:spacing_seed', 0)  # perturbation off; see utils.launch_options
         config.setdefault('audio:seed', randint(1, 4_294_967_295))  # nosec
-        config.setdefault('canvas:seed', randint(1, 4_294_967_295))  # nosec
 
         # Determine target OS from platform for font/voice generation
         plat = config.get('navigator.platform', '')
@@ -1868,21 +1791,27 @@ def generate_context_fingerprint(
         elif 'Linux' in plat or 'linux' in plat:
             os_name = 'linux'
 
-        # Add fonts (BrowserForge doesn't generate these)
+        # Add fonts (fpgen.yml does not map these yet)
         if 'fonts' not in config:
             try:
                 config['fonts'] = _generate_random_font_subset(os_name, seed=identity_seed(config, _salt))
-            except Exception:
-                pass
+            except (OSError, ValueError) as e:
+                FallbackWarning.warn(
+                    'Drawing the font list', "the browser's launch-time fonts", e,
+                    config.get('navigator.userAgent'),
+                )
 
-        # Add voices (BrowserForge doesn't generate these)
+        # Add voices (fpgen.yml does not map these yet)
         if 'voices' not in config:
             try:
                 config['voices'] = _generate_random_voice_subset(os_name, seed=identity_seed(config, _salt))
-            except Exception:
-                pass
+            except (OSError, ValueError, KeyError) as e:
+                FallbackWarning.warn(
+                    'Drawing the speech voices', "the browser's launch-time voices", e,
+                    config.get('navigator.userAgent'),
+                )
 
-        # Derive oscpu if BrowserForge didn't provide it
+        # Derive oscpu if the fingerprint didn't provide it
         if 'navigator.oscpu' not in config:
             plat = config.get('navigator.platform', '')
             if plat == 'MacIntel':
@@ -1892,8 +1821,11 @@ def generate_context_fingerprint(
             elif 'Linux' in plat or 'linux' in plat:
                 config['navigator.oscpu'] = 'Linux x86_64'
 
-        # Sample WebGL vendor/renderer from database (BrowserForge doesn't generate these)
+        # Draw the GPU and its WebGL data (fpgen.yml does not map these)
         if not config.get('webGl:vendor') or not config.get('webGl:renderer'):
+            # Not at the top: camoufox.webgl imports this module.
+            from .webgl import sample_webgl_for_screen
+
             _os_map = {'macos': 'mac', 'linux': 'lin', 'windows': 'win'}
             _target_os = _os_map.get(os or '', None)
             if not _target_os:
@@ -1904,21 +1836,18 @@ def generate_context_fingerprint(
                     _target_os = 'lin'
                 else:
                     _target_os = 'mac'
-            try:
-                # Same coherence treatment launch_options applies (#729): lift
-                # netbook geometry, then keep the GPU consistent with whatever
-                # screen this identity ended up with. This path has no real
-                # display to reconcile against, so the floor is unconditional.
-                raise_screen_to_modern_floor(config)
-                webgl_fp = sample_webgl_for_screen(
-                    _target_os, config.get('screen.width'), config.get('screen.height')
-                )
-                webgl_fp.pop('webGl2Enabled', None)
-                config.update(webgl_fp)
-            except Exception:
-                pass
+            # Same coherence treatment launch_options applies (#729): lift
+            # netbook geometry, then keep the GPU consistent with whatever
+            # screen this identity ended up with. This path has no real
+            # display to reconcile against, so the floor is unconditional.
+            raise_screen_to_modern_floor(config)
+            webgl_fp = sample_webgl_for_screen(
+                _target_os, config.get('screen.width'), config.get('screen.height')
+            )
+            webgl_fp.pop('webGl2Enabled')
+            config.update(webgl_fp)
 
-        # Build source dicts from BrowserForge config for init_values
+        # Build source dicts from the fingerprint config for init_values
         nav = {
             'platform': config.get('navigator.platform'),
             'hardwareConcurrency': config.get('navigator.hardwareConcurrency'),
@@ -1953,9 +1882,7 @@ def generate_context_fingerprint(
 
     # Build the values dict for the init script (works for both paths)
     init_values: Dict[str, Any] = {
-        'fontSpacingSeed': config.get('fonts:spacing_seed'),
         'audioFingerprintSeed': config.get('audio:seed'),
-        'canvasSeed': config.get('canvas:seed'),
         'navigatorPlatform': nav.get('platform'),
         'navigatorOscpu': config.get('navigator.oscpu'),
         'navigatorUserAgent': config.get('navigator.userAgent'),
@@ -2012,7 +1939,7 @@ def _cast_to_properties(
     ff_version: Optional[str] = None,
 ) -> None:
     """
-    Casts Browserforge fingerprints to Camoufox config properties.
+    Casts a generated fingerprint to Camoufox config properties.
     """
     for key, data in bf_dict.items():
         # Ignore non-truthy values

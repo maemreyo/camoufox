@@ -11,16 +11,12 @@ never existed.
 What it covers:
 
   fingerprint-presets.json, fingerprint-presets-v150.json
-      Each preset is converted the way a launch converts it and checked. A row
+      Each preset is converted the way a launch converts it and checked, and
+      its GPU must be one fpgen has seen Firefox report on that OS: WebGL
+      parameters come from fpgen, and a GPU it has never seen has none. A row
       that fails is dropped rather than repaired: repairing would write an
       invented value ("what core count does a 2-core Apple M1 really have?")
       into a file whose entire purpose is being real.
-
-  webgl/webgl_data.db
-      Each (vendor, renderer) pair carries a probability per OS. A pair the OS
-      cannot report has that probability zeroed, which keeps the row for the
-      platforms where it IS real -- "Radeon R9 200 Series" is a genuine Linux
-      and Windows GPU, it simply never shipped in a Mac.
 
 Usage:
     python3 scripts/clean-fingerprint-data.py            # report only
@@ -33,7 +29,6 @@ reintroduces a bad row fails CI rather than shipping.
 
 import argparse
 import json
-import sqlite3
 import sys
 from collections import Counter
 from pathlib import Path
@@ -43,12 +38,12 @@ sys.path.insert(0, str(REPO / 'pythonlib'))
 
 from camoufox import coherence  # noqa: E402
 from camoufox.fingerprints import from_preset  # noqa: E402
+from camoufox.webgl import firefox_gpus  # noqa: E402
 
 PRESET_FILES = (
     REPO / 'pythonlib' / 'camoufox' / 'fingerprint-presets.json',
     REPO / 'pythonlib' / 'camoufox' / 'fingerprint-presets-v150.json',
 )
-WEBGL_DB = REPO / 'pythonlib' / 'camoufox' / 'webgl' / 'webgl_data.db'
 OS_KEY = {'macos': 'mac', 'windows': 'win', 'linux': 'lin'}
 # The Firefox version only decides the UA rewrite, which no rule reads.
 FF_VERSION = '152'
@@ -60,7 +55,12 @@ def preset_violations(preset, os_name):
         config = from_preset(preset, FF_VERSION)
     except Exception as exc:  # a row too malformed to convert is itself a defect
         return [coherence.Violation('unconvertible', f'{type(exc).__name__}: {exc}')]
-    return coherence.validate(config, OS_KEY[os_name])
+    violations = coherence.validate(config, OS_KEY[os_name])
+    gpu = (preset.get('webgl', {}).get('unmaskedVendor'), preset.get('webgl', {}).get('unmaskedRenderer'))
+    if gpu not in firefox_gpus(os_name):
+        violations.append(coherence.Violation(
+            'gpu-without-webgl-data', f'fpgen has never seen Firefox on {os_name} report {gpu[1]!r}'))
+    return violations
 
 
 def clean_presets(path, write):
@@ -97,30 +97,6 @@ def clean_presets(path, write):
     return dropped_total
 
 
-def clean_webgl_db(write):
-    connection = sqlite3.connect(WEBGL_DB)
-    cursor = connection.cursor()
-    cursor.execute('SELECT rowid, vendor, renderer, win, mac, lin FROM webgl_fingerprints')
-    rows = cursor.fetchall()
-    zeroed = 0
-    for rowid, vendor, renderer, *weights in rows:
-        for column, weight in zip(('win', 'mac', 'lin'), weights):
-            if weight and weight > 0 and not coherence.gpu_fits_os(renderer, column):
-                zeroed += 1
-                print(f'  zero webgl_data.db {column}={weight:.3f} for {renderer[:58]!r}')
-                if write:
-                    cursor.execute(
-                        f'UPDATE webgl_fingerprints SET {column} = 0 WHERE rowid = ?',  # nosec
-                        (rowid,),
-                    )
-    if write and zeroed:
-        connection.commit()
-    connection.close()
-    print(f'webgl_data.db: {zeroed} impossible OS weight(s)'
-          + (' zeroed' if write and zeroed else ''))
-    return zeroed
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--write', action='store_true', help='rewrite the data files')
@@ -128,7 +104,6 @@ def main():
     args = parser.parse_args()
 
     total = sum(clean_presets(path, args.write) for path in PRESET_FILES)
-    total += clean_webgl_db(args.write)
 
     if not total:
         print('\nEvery shipped identity is coherent.')

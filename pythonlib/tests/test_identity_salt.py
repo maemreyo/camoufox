@@ -42,7 +42,7 @@ def launch(**kwargs):
         return config_of(utils.launch_options(**kwargs))
 
 
-DRAWN = ("canvas:seed", "audio:seed", "fonts", "voices", "webGl:renderer")
+DRAWN = ("audio:seed", "fonts", "voices", "webGl:renderer")
 
 
 def drawn(config):
@@ -51,7 +51,7 @@ def drawn(config):
 
 class TestUnpinnedLaunchesAreDistinct:
     def test_noise_seeds_do_not_collide(self):
-        seeds = [launch()["canvas:seed"] for _ in range(40)]
+        seeds = [launch()["audio:seed"] for _ in range(40)]
         # 40 draws from 2**32: any collision means the seed space collapsed.
         assert len(set(seeds)) == len(seeds)
 
@@ -77,33 +77,31 @@ class TestPinnedIdentityIsStable:
             pytest.skip("no presets bundled")
         first = launch(os="windows", fingerprint_preset=preset)
         second = launch(os="windows", fingerprint_preset=preset)
-        assert (first["canvas:seed"], first["audio:seed"]) == (second["canvas:seed"], second["audio:seed"])
+        assert first["audio:seed"] == second["audio:seed"]
         assert first["fonts"] == second["fonts"]
 
     @pytest.mark.parametrize("os_name", ["windows", "macos", "linux"])
     def test_every_bundled_preset_launches(self, os_name):
         # The test above draws ONE preset at random, so a preset that cannot
-        # launch shows up as a 1-in-11 flake rather than a failure -- which is
-        # how it reached CI. 39 of the 435 bundled presets name a GPU that is
-        # not among the 33 in webgl_data.db, and sample_webgl raises for those.
-        # Every preset has to produce launch options; see the fallback in
-        # utils.launch_options.
-        from camoufox.webgl import sample_webgl
-
+        # launch would show up as a flake rather than a failure. Every preset
+        # must launch with its own GPU and that GPU's recorded parameters.
         presets = fp.load_presets("150")["presets"][os_name]
-        key = {"windows": "win", "macos": "mac", "linux": "lin"}[os_name]
         for i, preset in enumerate(presets):
             config = launch(os=os_name, fingerprint_preset=preset)
-            # Whatever GPU survives, the renderer the page reads and the
-            # parameters behind it must come from the SAME recorded device --
-            # merge_into does not overwrite, so a fallback that forgets to drop
-            # the preset's pair leaves one device's name on another's data.
+            assert config["webGl:renderer"] == preset["webgl"]["unmaskedRenderer"], (os_name, i)
             assert config.get("webGl:parameters"), (os_name, i)
-            sample_webgl(key, config["webGl:vendor"], config["webGl:renderer"])
 
-    def test_caller_seeds_are_kept(self):
-        config = launch(config={"canvas:seed": 7, "audio:seed": 9})
-        assert (config["canvas:seed"], config["audio:seed"]) == (7, 9)
+    def test_caller_seed_is_kept(self):
+        assert launch(config={"audio:seed": 9})["audio:seed"] == 9
+
+
+def test_no_canvas_seed_is_generated():
+    """The browser adds no canvas noise (#528), and no patch reads canvas:seed
+    (#721). Generating one only sent the browser a value it ignored."""
+    assert "canvas:seed" not in launch()
+    context = fp.generate_context_fingerprint(os="linux")
+    assert "canvas:seed" not in context["config"]
+    assert "setCanvasSeed" not in context["init_script"]
 
     def test_salt_of_equal_objects_is_equal(self):
         a = fp.generate_fingerprint(os="windows")
@@ -162,3 +160,34 @@ class TestPrefsEnvIsAscii:
         joined = "".join(env[f"CAMOU_PREFS_{i}"] for i in range(1, len(env) + 1))
         assert joined.isascii()
         assert orjson.loads(joined) == prefs
+
+
+@pytest.mark.parametrize("off", [None, False])
+def test_fingerprint_preset_off_never_draws_a_preset(off):
+    """`fingerprint_preset=False` means off, the same as None. It used to be
+    checked with `is not None`, so False drew a random bundled preset."""
+    with mock.patch.object(utils, "get_random_preset", side_effect=AssertionError("preset drawn")):
+        launch(fingerprint_preset=off)
+
+
+def test_no_glyph_spacing_seed_is_generated():
+    """Glyph-spacing noise moved every measured text width off what the same
+    font gives on a real machine, so it was itself a fingerprint; the feature
+    is gone from the browser, and the launcher sends nothing for it."""
+    assert "fonts:spacing_seed" not in launch()
+    context = fp.generate_context_fingerprint(os="linux")
+    assert "fonts:spacing_seed" not in context["config"]
+    assert "setFontSpacingSeed" not in context["init_script"]
+
+
+def test_config_overrides_reach_the_config_and_the_init_script():
+    context = fp.generate_context_fingerprint(os="linux", config_overrides={"audio:seed": 7})
+    assert context["config"]["audio:seed"] == 7
+    assert "setAudioFingerprintSeed(7)" in context["init_script"]
+
+
+def test_instant_animations_warn_that_they_are_detectable():
+    from camoufox._warnings import LeakWarning
+
+    with pytest.warns(LeakWarning, match="getComputedTiming"):
+        launch(config={"instantAnimations": True}, i_know_what_im_doing=False)

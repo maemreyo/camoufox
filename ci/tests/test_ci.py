@@ -237,11 +237,11 @@ def test_version_parsing():
 
 def test_upstream_sh_roundtrip_preserves_comments(tmp_path):
     path = tmp_path / "upstream.sh"
-    path.write_text("# a comment\nversion=152.0.4\nrelease=beta.31\nclosedsrc_rev=1.0.0\n")
+    path.write_text("# a comment\nversion=152.0.4\nrelease=beta.31\nextra=1\n")
     write_upstream_sh({"version": "153.0.4", "release": "beta.32"}, path)
     text = path.read_text()
     assert "# a comment" in text
-    assert "closedsrc_rev=1.0.0" in text
+    assert "extra=1" in text
     assert read_upstream_sh(path)["version"] == "153.0.4"
 
 
@@ -602,7 +602,7 @@ def _cross(**kw):
 
 
 def test_a_shared_per_context_value_is_a_leak():
-    """audio, canvas and timezone are derived per context.
+    """audio and timezone are derived per context.
 
     Two contexts sharing one is the failure this whole suite exists to catch.
     """
@@ -614,19 +614,14 @@ def test_a_shared_per_context_value_is_a_leak():
         assert not out["noise"]
 
 
-def test_canvas_collisions_are_tracked_but_do_not_gate():
-    """Canvas belongs in must-vary and does not hold there yet.
-
-    Measured 16 distinct canvas fingerprints in 24 samples where audio gave
-    24/24 -- so two contexts collide about a third of the time. Gating would
-    fail one run in three for a real, unfixed reason; silence would lose the
-    finding. It gets its own bucket and is reported every run.
-    """
+def test_a_shared_canvas_is_noise_not_a_leak():
+    """The canvas is rendered, not noised (#528), so contexts with the same
+    fonts and GPU draw the same image, as two real machines would."""
     from ci.run_build_tester import uniqueness
 
     out = uniqueness(_cross(uniqueCanvas=2))
-    assert out["low_entropy"] == ["macPerContext.uniqueCanvas (2/3 distinct)"]
-    assert not out["leaks"] and not out["noise"]
+    assert out["noise"] == ["macPerContext.uniqueCanvas (2/3 distinct)"]
+    assert not out["leaks"]
 
 
 def test_a_shared_preset_value_is_noise_not_a_leak():
@@ -2584,3 +2579,47 @@ def test_group_timeout_is_shorter_than_the_job_timeout():
     # Four times the slowest healthy invocation measured (296s); below that it
     # starts cutting slow-but-working groups short.
     assert default >= 900
+
+
+# ---------------------------------------------------------------------------
+# build-tester agrees with the identities pythonlib can present
+# ---------------------------------------------------------------------------
+
+
+def test_build_tester_accepts_every_core_count_pythonlib_presents():
+    """A real identity must not fail build-tester's plausibility check.
+
+    build-tester's plausibleHWC list lacked 18 and 22 -- both real (Intel Meteor
+    Lake laptops) and both in the recorded presets -- so a run that drew one of
+    the two Linux presets reporting 22 failed. About one run in eleven, on any
+    pull request. The list follows the data, not the other way round.
+    """
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    source = (repo / "build-tester/src/lib/checks/extended.ts").read_text(encoding="utf-8")
+    block = source[source.index("plausibleHWC"):]
+    listed = re.search(r"const common = \[([^\]]*)\]", block)
+    assert listed, "plausibleHWC's list of common core counts was not found"
+    accepted = {int(n) for n in re.findall(r"\d+", listed.group(1))}
+
+    presented = set()
+    lib = repo / "pythonlib/camoufox"
+    for name in ("fingerprint-presets.json", "fingerprint-presets-v150.json"):
+        data = json.loads((lib / name).read_text(encoding="utf-8"))
+        for rows in data.get("presets", {}).values():
+            for row in rows:
+                hwc = row.get("navigator", {}).get("hardwareConcurrency")
+                if isinstance(hwc, int):
+                    presented.add(hwc)
+    table = re.search(
+        r"^PLAUSIBLE_CORE_COUNTS = \(([^)]*)\)",
+        (lib / "fingerprints.py").read_text(encoding="utf-8"),
+        re.M,
+    )
+    assert table, "PLAUSIBLE_CORE_COUNTS was not found in fingerprints.py"
+    presented |= {int(n) for n in re.findall(r"\d+", table.group(1))}
+
+    missing = sorted(presented - accepted)
+    assert not missing, (
+        f"build-tester's plausibleHWC rejects core counts pythonlib presents: {missing}. "
+        "Add them to the list in build-tester/src/lib/checks/extended.ts."
+    )

@@ -8,7 +8,6 @@ from os import environ
 from os.path import abspath
 from pathlib import Path
 from pprint import pprint
-from random import randint
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -23,7 +22,7 @@ from .exceptions import (
     InvalidPropertyType,
     NonFirefoxFingerprint,
 )
-from .fingerprints import Screen, from_fpgen, from_preset, generate_fingerprint, get_random_preset, _generate_random_font_subset, _generate_random_voice_subset, fix_navigator_arch, fix_hardware_concurrency, identity_salt, identity_seed, fix_screen_no_taskbar, clamp_screen_to_display, clamp_window_dimensions, clamp_window_position, raise_screen_to_modern_floor, sample_webgl_for_screen, set_media_devices_defaults, WINDOWS_11_MARKER_FONTS
+from .fingerprints import Screen, from_fpgen, from_preset, generate_fingerprint, get_random_preset, _generate_random_font_subset, _generate_random_voice_subset, fix_navigator_arch, fix_hardware_concurrency, identity_salt, identity_seed, fix_screen_no_taskbar, clamp_screen_to_display, clamp_window_dimensions, clamp_window_position, raise_screen_to_modern_floor, set_media_devices_defaults, WINDOWS_11_MARKER_FONTS
 from . import coherence
 from .geolocation import geoip_allowed, get_geolocation
 from .ip import Proxy, public_ip, valid_ipv4, valid_ipv6
@@ -41,8 +40,8 @@ from .pkgman import (
     launch_path,
 )
 from .virtdisplay import VirtualDisplay
-from ._warnings import LeakWarning
-from .webgl import sample_webgl
+from ._warnings import FallbackWarning, LeakWarning
+from .webgl import sample_webgl_for_screen, webgl_for_gpu
 
 ListOrString: TypeAlias = Union[Tuple[str, ...], List[str], str]
 
@@ -309,7 +308,7 @@ def get_env_vars(
         }
         os_dir = directory_map.get(user_agent_os, user_agent_os)
 
-        # v150+ uses "fontconfig/" (matching the Go launcher); older bundles shipped "fontconfigs/".
+        # v150+ uses "fontconfig/"; older bundles shipped "fontconfigs/".
         def _bundle_path(*parts: str) -> str:
             if path:
                 return str(path.parent.joinpath(*parts))
@@ -515,15 +514,6 @@ def check_valid_os(os: ListOrString) -> None:
         raise InvalidOS(f"Camoufox does not support the OS: '{os}'")
 
 
-def _clean_locals(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Gets the launch options from the locals of the function.
-    """
-    del data['playwright']
-    del data['persistent_context']
-    return data
-
-
 def merge_into(target: Dict[str, Any], source: Dict[str, Any]) -> None:
     """
     Merges new keys/values from the source dictionary into the target dictionary.
@@ -568,7 +558,7 @@ def warn_manual_config(config: Dict[str, Any]) -> None:
     """
     # Manual locale setting
     if is_domain_set(
-        config, 'navigator.language', 'navigator.languages', 'headers.Accept-Language', 'locale:'
+        config, 'navigator.language', 'headers.Accept-Language', 'locale:'
     ):
         LeakWarning.warn('locale', False)
     # Manual geolocation and timezone setting
@@ -585,6 +575,8 @@ def warn_manual_config(config: Dict[str, Any]) -> None:
     # CSS pointer media queries and the TouchEvent interfaces.
     if is_domain_set(config, 'navigator.maxTouchPoints'):
         LeakWarning.warn('max_touch_points', False)
+    if config.get('instantAnimations'):
+        LeakWarning.warn('instant_animations', False)
     # Manual screen/window setting
     if is_domain_set(config, 'screen.', 'window.', 'document.body.'):
         LeakWarning.warn('viewport', False)
@@ -595,8 +587,6 @@ _WINDOW_DIM_KEYS = (
     'window.outerHeight',
     'window.innerWidth',
     'window.innerHeight',
-    'document.body.clientWidth',
-    'document.body.clientHeight',
 )
 
 
@@ -894,16 +884,16 @@ def launch_options(
             If not provided, a random fingerprint will be generated based on the provided
             `os` & `screen` constraints.
         fingerprint_preset (Optional[Union[bool, Dict[str, Any]]]):
-            Opt into using real fingerprint presets instead of BrowserForge.
+            Opt into using real fingerprint presets instead of fpgen.
             Pass `True` to use a random bundled preset, or pass a preset dict directly.
-            By default (None), BrowserForge is used for infinite unique fingerprints.
+            By default (None), fpgen generates a unique fingerprint.
         ff_version (Optional[int]):
             Firefox version to use. Defaults to the current Camoufox version.
             To prevent leaks, only use this for special cases.
         headless (Optional[bool]):
             Whether to run the browser in headless mode. Defaults to False.
-            Note: If you are running linux, passing headless='virtual' to Camoufox & AsyncCamoufox
-            will use Xvfb.
+            Note: If you are running linux, passing headless='virtual' to Camoufox, AsyncCamoufox
+            or launch_server will use Xvfb.
         main_world_eval (Optional[bool]):
             Whether to enable running scripts in the main world.
             To use this, prepend "mw:" to the script: page.evaluate("mw:" + script).
@@ -931,7 +921,7 @@ def launch_options(
         debug (Optional[bool]):
             Prints the config being sent to Camoufox.
         virtual_display (Optional[str]):
-            Virtual display number. Ex: ':99'. This is handled by Camoufox & AsyncCamoufox.
+            Virtual display number. Ex: ':99'. This is handled by Camoufox, AsyncCamoufox and launch_server.
         pin_cpu_cores (Optional[bool]):
             Pin the browser to navigator.hardwareConcurrency cores
             (Linux/Windows) so the fingerprint's own core count can be kept:
@@ -941,6 +931,8 @@ def launch_options(
             which is equally coherent, just less diverse.
         webgl_config (Optional[Tuple[str, str]]):
             Use a specific WebGL vendor/renderer pair. Passed as a tuple of (vendor, renderer).
+            The pair must be one fpgen has recorded from Firefox on `os`
+            (camoufox.webgl.firefox_gpus); any other raises ValueError.
         **launch_options (Dict[str, Any]):
             Additional Firefox launch options.
     """
@@ -1004,7 +996,7 @@ def launch_options(
     _user_set_dnt = 'navigator.doNotTrack' in config
     _user_set_gpc = 'navigator.globalPrivacyControl' in config
     _user_set_accept_encoding = 'headers.Accept-Encoding' in config
-    _user_set_noise_seeds = {k for k in ('audio:seed', 'canvas:seed') if k in config}
+    _user_set_audio_seed = 'audio:seed' in config
 
     # The salt that makes every seeded draw belong to this identity (see
     # fingerprints.identity_salt): stable when the caller pinned the identity
@@ -1045,10 +1037,10 @@ def launch_options(
     # Generate a fingerprint
     _used_preset = False
     if fingerprint is not None:
-        # User passed a custom BrowserForge fingerprint
+        # User passed a custom fingerprint
         if not i_know_what_im_doing:
             check_custom_fingerprint(fingerprint)
-    elif fingerprint_preset is not None:
+    elif fingerprint_preset:
         # User opted into real fingerprint presets
         if isinstance(fingerprint_preset, dict):
             preset = fingerprint_preset
@@ -1156,7 +1148,11 @@ def launch_options(
                 # OS base is claimed
                 native=(target_os in ('mac', 'win') and _host_os_key() == target_os),
             )
-        except Exception:
+        except (OSError, ValueError) as e:
+            FallbackWarning.warn(
+                'Drawing the font list', f"every font fonts.json lists for {target_os}", e,
+                config.get('navigator.userAgent'),
+            )
             update_fonts(config, target_os)
 
     # Draw the identity's media devices (counts + OS-style labels/groups from
@@ -1277,23 +1273,15 @@ def launch_options(
     if not _user_set_accept_encoding:
         config.pop('headers.Accept-Encoding', None)
 
-    # Set random seeds for fingerprint noise (per launch)
-    # Glyph-advance perturbation is OFF by default (seed 0): it moves every
-    # measured text width off the value the same font produces on a real
-    # machine (measured 2026-09-14: +1 px per ~100 glyphs, fractional deltas
-    # on every measureText), which is a fingerprint no stock Firefox emits.
-    # Pass fonts:spacing_seed explicitly to opt back in.
-    set_into(config, 'fonts:spacing_seed', 0)
-    # audio/canvas noise seeds follow the identity: a returning "same device"
-    # must reproduce its audio and canvas hashes (#442/#765). Derived, not
-    # equal, so the two streams differ; never 0 (0 disables the noise).
-    # A preset draws its own random seeds; they are replaced here too so a
-    # pinned preset reproduces them, but a seed the caller set is kept.
-    _ident = identity_seed(config, _identity_salt)
-    if 'audio:seed' not in _user_set_noise_seeds:
+    # The audio noise seed follows the identity: a returning "same device" must
+    # reproduce its audio hash (#442/#765). Never 0 (0 disables the noise). A
+    # preset draws its own random seed; it is replaced here too so a pinned
+    # preset reproduces it, but a seed the caller set is kept. There is no
+    # canvas seed: the browser adds no canvas noise (#528), and no glyph-spacing
+    # noise either (ci/tribal-rules.yml: no-glyph-spacing-noise).
+    if not _user_set_audio_seed:
+        _ident = identity_seed(config, _identity_salt)
         config['audio:seed'] = ((_ident * 2654435761 + 97) & 0xFFFFFFFF) or 1
-    if 'canvas:seed' not in _user_set_noise_seeds:
-        config['canvas:seed'] = ((_ident * 40503 + 12345) & 0xFFFFFFFF) or 1
 
     # Set geolocation
     if geoip:
@@ -1392,10 +1380,13 @@ def launch_options(
             config['voices'] = _generate_random_voice_subset(
                 os_name_v, voice_locale, seed=identity_seed(config, _identity_salt)
             )
-        except Exception:
+        except (OSError, ValueError, KeyError) as e:
             # An empty list still blocks the host's voices (see below), so a
             # generation failure degrades to "no voices" rather than "all of
             # the host's".
+            FallbackWarning.warn(
+                'Drawing the speech voices', 'no speech voices', e, config.get('navigator.userAgent')
+            )
             config['voices'] = []
 
     # Pin the block explicitly instead of relying on a non-empty list to imply
@@ -1430,46 +1421,22 @@ def launch_options(
         LeakWarning.warn('disable_coop', i_know_what_im_doing)
         firefox_user_prefs['browser.tabs.remote.useCrossOriginOpenerPolicy'] = False
 
-    # Allow allow_webgl parameter for backwards compatibility
-    if block_webgl or launch_options.pop('allow_webgl', True) is False:
+    if block_webgl:
         firefox_user_prefs['webgl.disabled'] = True
         LeakWarning.warn('block_webgl', i_know_what_im_doing)
     else:
-        # If the user has provided a specific WebGL vendor/renderer pair, use it
+        # A pair the caller named, or the preset's own GPU, keeps its name and
+        # gets that device's recorded parameters. webgl_for_gpu raises for a GPU
+        # fpgen has never seen: the caller asked for something that does not exist.
         if webgl_config:
-            webgl_fp = sample_webgl(target_os, *webgl_config, seed=identity_seed(config, _identity_salt))
+            webgl_fp = webgl_for_gpu(target_os, *webgl_config, seed=identity_seed(config, _identity_salt))
         elif config.get('webGl:vendor') and config.get('webGl:renderer'):
-            # Preset already set vendor/renderer — sample matching WebGL params
-            try:
-                webgl_fp = sample_webgl(target_os, config['webGl:vendor'], config['webGl:renderer'], seed=identity_seed(config, _identity_salt))
-            except ValueError:
-                # The pair is not in webgl_data.db, which holds 33 GPUs. 39 of the
-                # 435 bundled presets name one it does not have -- including rows
-                # that cannot be the OS they are filed under, e.g. a Windows
-                # preset claiming "ANGLE (Unknown, Adreno (TM) 650 ...)", a phone
-                # GPU. Raising here made launch_options() fail outright for ~9% of
-                # presets, and a caller passing their own preset dict had no way
-                # to know which pairs are supported.
-                #
-                # There is no way to keep the named GPU: the parameters, extension
-                # list and shader precisions all have to come from a real recorded
-                # device, and there is none for an unknown renderer. So draw a GPU
-                # that fits the screen and let it replace the pair -- the identity
-                # loses the preset's GPU string but stays internally coherent,
-                # which is the property that matters to a page reading both.
-                webgl_fp = sample_webgl_for_screen(
-                    target_os, config.get('screen.width'), config.get('screen.height'),
-                    seed=identity_seed(config, _identity_salt),
-                )
-                # merge_into does not overwrite keys that are already set, and the
-                # preset set these two. Drop them, or the page would read the
-                # preset's renderer string with another device's parameters,
-                # extensions and shader precisions behind it -- a mismatch louder
-                # than the unknown GPU we are replacing.
-                config.pop('webGl:vendor', None)
-                config.pop('webGl:renderer', None)
+            webgl_fp = webgl_for_gpu(
+                target_os, config['webGl:vendor'], config['webGl:renderer'],
+                seed=identity_seed(config, _identity_salt),
+            )
         else:
-            # Synthetic path: keep the GPU coherent with the screen BrowserForge
+            # Synthetic path: keep the GPU coherent with the screen fpgen
             # already picked. Sampling the two independently yields pairs no
             # real machine ships -- a discrete desktop GPU behind a 1024x600
             # panel -- which consistency checks read as masking (#729).
@@ -1493,7 +1460,7 @@ def launch_options(
     # Every identity passes the whole-identity checks, whatever built it: a
     # generated fingerprint, a bundled preset, or a config the caller wrote.
     # The pools are sampled independently -- navigator and screen from the
-    # generator, GPU from webgl_data.db, fonts and voices from their own
+    # generator, GPU from fpgen's WebGL records, fonts and voices from their own
     # catalogues -- so a machine that never existed can be assembled from parts
     # that are each fine on their own. See coherence.py.
     _incoherent = coherence.apply(config, target_os)
